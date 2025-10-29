@@ -256,6 +256,16 @@ class TimerTask:
             tool_name = command_dict["name"]
             arguments = command_dict["arguments"]
 
+            # 兼容历史/常见名称别名
+            alias_map = {
+                # 误将点号写成下划线（历史兼容）
+                "self_audio_speaker_set_volume": "self.audio_speaker.set_volume",
+                "self_application_launch": "self.application.launch",
+                # 简写/旧名（语义别名）
+                "self.set_volume": "self.audio_speaker.set_volume",
+            }
+            tool_name = alias_map.get(tool_name, tool_name)
+
             # 获取MCP服务器并执行工具
             from src.mcp.mcp_server import McpServer
 
@@ -269,14 +279,43 @@ class TimerTask:
                     break
 
             if not tool:
-                raise ValueError(f"MCP工具不存在: {tool_name}")
+                # 提示可选建议
+                suggestion = ""
+                try:
+                    import difflib
+
+                    candidates = [t.name for t in mcp_server.tools]
+                    matches = difflib.get_close_matches(tool_name, candidates, n=1)
+                    if matches:
+                        suggestion = f"（你是否要调用：{matches[0]}？）"
+                    elif "volume" in tool_name:
+                        suggestion = "（建议使用：self.audio_speaker.set_volume）"
+                    elif (
+                        ("application" in tool_name and "launch" in tool_name)
+                        or ("self_application_launch" in tool_name)
+                    ):
+                        suggestion = "（建议使用：self.application.launch）"
+                except Exception:
+                    pass
+                raise ValueError(f"MCP工具不存在: {tool_name} {suggestion}".strip())
 
             # 执行MCP工具
             result = await tool.call(arguments)
 
             # 解析结果
             result_data = json.loads(result)
-            is_success = not result_data.get("isError", False)
+            is_error = result_data.get("isError", False)
+            text = ""
+            try:
+                text = (result_data.get("content", [{}])[0].get("text", "") or "").strip()
+            except Exception:
+                text = ""
+
+            # 规则：
+            # - isError 为 True -> 失败
+            # - 文本严格等于 "false"（不区分大小写）-> 失败（布尔返回 False 的情况）
+            # - 其余视为成功
+            is_success = (not is_error) and (text.lower() != "false")
 
             if is_success:
                 logger.info(
@@ -284,7 +323,7 @@ class TimerTask:
                 )
                 await self._notify_execution_result(True, f"已执行 {tool_name}")
             else:
-                error_text = result_data.get("content", [{}])[0].get("text", "未知错误")
+                error_text = text or "未知错误"
                 logger.error(f"倒计时 {self.timer_id} 执行MCP工具失败: {error_text}")
                 await self._notify_execution_result(False, error_text)
 

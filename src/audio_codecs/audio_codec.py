@@ -13,6 +13,10 @@ from src.audio_codecs.aec_processor import AECProcessor
 from src.constants.constants import AudioConfig
 from src.utils.config_manager import ConfigManager
 from src.utils.logging_config import get_logger
+from src.utils.audio_device_helper import (
+    choose_input_device,
+    choose_output_device,
+)
 
 logger = get_logger(__name__)
 
@@ -335,7 +339,17 @@ class AudioCodec:
             picked_output = self.speaker_device_id
 
             if picked_input is None:
-                picked_input = self._auto_pick_device("input")
+                # 先尝试按设备名匹配（优先 ES8388 / 配置保存的名称）
+                name_keywords = []
+                if isinstance(audio_config.get("input_device_name"), str):
+                    name_keywords.append(audio_config["input_device_name"])
+                # 常见关键词兜底
+                name_keywords.extend(["ES8388", "hw:3", "rockchip,es8388"])
+
+                picked_input = choose_input_device(None, tuple(name_keywords))
+                if picked_input is None:
+                    picked_input = self._auto_pick_device("input")
+
                 if picked_input is not None:
                     self.mic_device_id = picked_input
                     d = devices[picked_input]
@@ -346,7 +360,16 @@ class AudioCodec:
                     )
 
             if picked_output is None:
-                picked_output = self._auto_pick_device("output")
+                # 先尝试按设备名匹配（优先 ES8388 / 配置保存的名称）
+                name_keywords = []
+                if isinstance(audio_config.get("output_device_name"), str):
+                    name_keywords.append(audio_config["output_device_name"])
+                name_keywords.extend(["ES8388", "hw:3", "rockchip,es8388", "sysdefault", "pulse"])
+
+                picked_output = choose_output_device(None, tuple(name_keywords))
+                if picked_output is None:
+                    picked_output = self._auto_pick_device("output")
+
                 if picked_output is not None:
                     self.speaker_device_id = picked_output
                     d = devices[picked_output]
@@ -429,17 +452,33 @@ class AudioCodec:
         创建音频流.
         """
         try:
-            # 麦克风输入流
-            self.input_stream = sd.InputStream(
-                device=self.mic_device_id,  # None=系统默认；或固定索引
-                samplerate=self.device_input_sample_rate,
-                channels=AudioConfig.CHANNELS,
-                dtype=np.int16,
-                blocksize=self._device_input_frame_size,
-                callback=self._input_callback,
-                finished_callback=self._input_finished_callback,
-                latency="low",
-            )
+            # 麦克风输入流（失败回退一次）
+            try:
+                self.input_stream = sd.InputStream(
+                    device=self.mic_device_id,  # None=系统默认；或固定索引
+                    samplerate=self.device_input_sample_rate,
+                    channels=AudioConfig.CHANNELS,
+                    dtype=np.int16,
+                    blocksize=self._device_input_frame_size,
+                    callback=self._input_callback,
+                    finished_callback=self._input_finished_callback,
+                    latency="low",
+                )
+            except Exception as e:
+                logger.warning(f"创建输入流失败，尝试回退选择设备: {e}")
+                # 回退：按名称匹配/第一个可用
+                new_idx = choose_input_device(None)
+                self.mic_device_id = new_idx
+                self.input_stream = sd.InputStream(
+                    device=self.mic_device_id,
+                    samplerate=self.device_input_sample_rate,
+                    channels=AudioConfig.CHANNELS,
+                    dtype=np.int16,
+                    blocksize=self._device_input_frame_size,
+                    callback=self._input_callback,
+                    finished_callback=self._input_finished_callback,
+                    latency="low",
+                )
 
             # 根据设备支持的采样率选择输出采样率
             if self.device_output_sample_rate == AudioConfig.OUTPUT_SAMPLE_RATE:
@@ -453,15 +492,12 @@ class AudioCodec:
                     self.device_output_sample_rate * (AudioConfig.FRAME_DURATION / 1000)
                 )
 
-            self.output_stream = sd.OutputStream(
-                device=self.speaker_device_id,  # None=系统默认；或固定索引
-                samplerate=output_sample_rate,
+            # 打开输出流，带多重回退（采样率/声道/设备）
+            self.output_stream = self._open_output_stream_with_fallback(
+                desired_device=self.speaker_device_id,
+                desired_rate=output_sample_rate,
+                frame_size=device_output_frame_size,
                 channels=AudioConfig.CHANNELS,
-                dtype=np.int16,
-                blocksize=device_output_frame_size,
-                callback=self._output_callback,
-                finished_callback=self._output_finished_callback,
-                latency="low",
             )
 
             self.input_stream.start()
@@ -472,6 +508,85 @@ class AudioCodec:
         except Exception as e:
             logger.error(f"创建音频流失败: {e}")
             raise
+
+    def _open_output_stream_with_fallback(
+        self,
+        desired_device: Optional[int],
+        desired_rate: int,
+        frame_size: int,
+        channels: int,
+    ):
+        """尝试打开输出流，包含多级回退：
+        1) 设备=desired_device，(rate, ch)
+        2) 设备=desired_device，(44100, ch) / (rate, 1) / (44100, 1)
+        3) 设备=按名称匹配/第一个可用
+        4) 设备=None（系统默认）
+        每步也尝试不同 (rate, ch) 组合。
+        """
+        def device_info(dev_idx):
+            try:
+                d = sd.query_devices(dev_idx)
+                ha = sd.query_hostapis()[d["hostapi"]]["name"]
+                return f"[{dev_idx}] {d.get('name')} host:{ha} out:{d.get('max_output_channels')} in:{d.get('max_input_channels')} def_rate:{d.get('default_samplerate')}"
+            except Exception:
+                return f"[{dev_idx}] <unknown>"
+
+        attempts = []
+        # 优先尝试指定设备
+        attempts.append((desired_device, desired_rate, channels))
+        if desired_rate != 44100:
+            attempts.append((desired_device, 44100, channels))
+        if channels != 1:
+            attempts.append((desired_device, desired_rate, 1))
+        if desired_rate != 44100 or channels != 1:
+            attempts.append((desired_device, 44100, 1))
+
+        # 回退到名称匹配/第一个可用
+        fallback_dev = choose_output_device(None)
+        if fallback_dev != desired_device:
+            attempts.append((fallback_dev, desired_rate, channels))
+            if desired_rate != 44100:
+                attempts.append((fallback_dev, 44100, channels))
+            if channels != 1:
+                attempts.append((fallback_dev, desired_rate, 1))
+            if desired_rate != 44100 or channels != 1:
+                attempts.append((fallback_dev, 44100, 1))
+
+        # 最后使用系统默认（None）
+        attempts.append((None, desired_rate, channels))
+        if desired_rate != 44100:
+            attempts.append((None, 44100, channels))
+        if channels != 1:
+            attempts.append((None, desired_rate, 1))
+        if desired_rate != 44100 or channels != 1:
+            attempts.append((None, 44100, 1))
+
+        last_err = None
+        for dev, rate, ch in attempts:
+            try:
+                # 记录尝试信息
+                dev_desc = "system-default" if dev is None else device_info(dev)
+                logger.info(f"尝试打开输出流: device={dev_desc}, rate={rate}, ch={ch}")
+                # 放宽参数（移除低延时、允许默认 blocksize）
+                stream = sd.OutputStream(
+                    device=dev,
+                    samplerate=int(rate),
+                    channels=int(ch),
+                    dtype=np.int16,
+                    blocksize=None,
+                    callback=self._output_callback,
+                    finished_callback=self._output_finished_callback,
+                )
+                # 一旦成功，更新当前选择
+                self.speaker_device_id = dev
+                # 如果与24k差异，frame_size 会在上层用于队列尺寸，但这里让 PortAudio 选择合理 blocksize
+                return stream
+            except Exception as e:
+                last_err = e
+                continue
+
+        # 所有尝试失败
+        raise last_err
 
     def _input_callback(self, indata, frames, time_info, status):
         """
